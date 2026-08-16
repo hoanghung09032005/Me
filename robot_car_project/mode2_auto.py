@@ -10,6 +10,8 @@ nối ở mode nào thì mode kia cũng dùng được luôn, không phải nố
 Phần dò line + PID nằm hoàn toàn trong STM32 (main.c / mode2_obstacle.c).
 Giao diện chỉ:
   - gửi "A" (bắt đầu tự động) / "S" (dừng khẩn cấp)
+  - gửi "H" (heartbeat) định kỳ trong lúc Auto đang chạy - BẮT BUỘC, xem
+    ghi chú ở toggle_auto()/_start_link_polling() bên dưới.
   - vẽ lại dữ liệu xe bắn về: 5 mắt dò line + 2 mắt biên, error, PWM 2
     bánh, khoảng cách vật cản, nhiệt độ/độ ẩm.
 
@@ -20,6 +22,18 @@ THAY ĐỔI so với bản trước:
     thật theo trạm) - chỉ còn hiển thị đúng số đo cảm biến thật xe gửi về.
   - Giao diện dựng lại giống Mode 1: cột trái có khung "Kết nối xe" +
     "Bật camera" y hệt Mode 1, cột phải là video + log.
+  - FIX (quan trọng): trước đây GUI chỉ gửi "A" đúng 1 lần lúc bấm nút rồi
+    không gửi gì thêm. Firmware (main.c) có cơ chế AUTO_LINK_TIMEOUT_TICKS
+    (~1.5s) - nếu không nhận được BẤT KỲ lệnh nào (kể cả heartbeat) trong
+    lúc đang Auto, nó tự lặng lẽ trả car_mode về MODE_IDLE TRONG ISR,
+    KHÔNG gửi ACK/log gì về PC (lý do an toàn: không được gọi
+    UART_SendString block trong ISR ưu tiên cao nhất). Kết quả: GUI vẫn
+    tưởng đang chạy Auto (TCP vẫn "connected") nhưng xe đã im lặng dừng
+    hẳn sau đúng 1.5 giây kể từ lúc bấm nút - đây chính là lỗi "xe chỉ
+    chạy lúc mới bấm rồi im lìm" đã gặp. Đã thêm gọi heartbeat() định kỳ
+    trong _start_link_polling() (chạy mỗi TELEMETRY_POLL_MS = 50ms, dư sức
+    so với ngưỡng 1.5s) để giữ "sự sống" bên firmware trong suốt thời gian
+    Auto đang chạy.
 """
 
 import cv2
@@ -30,6 +44,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 import config
 import communication
+import image_enhance
 from video_stream import MJPEGReader
 
 
@@ -297,6 +312,12 @@ class AutoPatrolFrame(tk.Frame):
             self.auto_btn.config(text="■ DỪNG TỰ ĐỘNG")
             communication.link.start_auto()
             self._log("[LỆNH] START - đặt xe lên vạch đen để nhả khoá ga.")
+            # LƯU Ý: chỉ gửi "A" một lần ở đây là KHÔNG ĐỦ để xe chạy liên
+            # tục - firmware sẽ tự dừng sau ~1.5s nếu không có thêm lệnh
+            # nào. Việc "nuôi sống" kết nối trong suốt thời gian Auto chạy
+            # được thực hiện bằng cách gọi heartbeat() định kỳ trong
+            # _start_link_polling() bên dưới, chừng nào self.auto_running
+            # còn True.
 
     # ==================================================================
     # KẾT NỐI XE (giống hệt cách làm của Mode 1: có ô nhập IP riêng)
@@ -313,6 +334,16 @@ class AutoPatrolFrame(tk.Frame):
     def _start_link_polling(self):
         if not self.is_active:
             return
+
+        # FIX QUAN TRỌNG: gửi heartbeat định kỳ trong lúc Auto đang chạy để
+        # "làm mới" last_command_tick bên firmware. Nếu không gửi, sau
+        # AUTO_LINK_TIMEOUT_TICKS (~1.5s, xem main.c) firmware sẽ TỰ lặng lẽ
+        # trả car_mode về MODE_IDLE trong ISR - không có ACK/log báo về nên
+        # GUI vẫn hiển thị như đang chạy bình thường trong khi xe đã dừng
+        # hẳn. Hàm này chạy mỗi TELEMETRY_POLL_MS (mặc định 50ms trong
+        # config.py) nên dư sức đáp ứng ngưỡng 1.5s của firmware.
+        if self.auto_running and communication.link.connected:
+            communication.link.heartbeat()
 
         try:
             for kind, payload in communication.link.poll_events():
@@ -441,19 +472,30 @@ class AutoPatrolFrame(tk.Frame):
         )
 
     def _display_frame(self, bgr_frame):
+        # _process_frame là chỗ dành riêng cho AI/CV sau này (vd nhận diện
+        # line/vật cản qua ảnh, vẽ overlay debug...) - tách biệt hoàn toàn
+        # với enhance_frame() (chỉ mang tính thẩm mỹ cho người xem, xem
+        # docstring image_enhance.py). self._video_last_frame LUÔN giữ bản
+        # RAW (chưa enhance) để:
+        #   1) khi cửa sổ resize, vẽ lại đúng theo trạng thái
+        #      IMAGE_ENHANCE_ENABLED HIỆN TẠI (không bị "đóng băng" bản đã
+        #      enhance từ lần vẽ trước).
+        #   2) không làm bẩn dữ liệu gốc nếu sau này nối vào pipeline AI.
         raw_frame = self._process_frame(bgr_frame)
         self._video_last_frame = raw_frame
+        display_frame = image_enhance.enhance_frame(raw_frame)
+
         target_w, target_h = self._video_display_size
         if target_w <= 0 or target_h <= 0:
             return
 
-        frame_h, frame_w = raw_frame.shape[:2]
+        frame_h, frame_w = display_frame.shape[:2]
         scale = min(target_w / frame_w, target_h / frame_h)
         new_w = max(1, int(frame_w * scale))
         new_h = max(1, int(frame_h * scale))
 
         interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
-        resized = cv2.resize(raw_frame, (new_w, new_h), interpolation=interpolation)
+        resized = cv2.resize(display_frame, (new_w, new_h), interpolation=interpolation)
         rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb_frame)
 
