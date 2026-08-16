@@ -7,6 +7,7 @@ from PIL import Image, ImageTk
 
 import config
 import communication
+import image_enhance
 from video_stream import MJPEGReader
 
 KEY_MAP = {
@@ -598,18 +599,27 @@ class ManualControlFrame(tk.Frame):
         self._video_after_id = self.after(33, self._start_video_polling)
 
     def _display_frame(self, bgr_frame):
+        # self._video_last_frame LUÔN giữ bản RAW (chưa qua hậu kỳ
+        # CLAHE/sharpen) - enhance chỉ áp dụng ở bước hiển thị, không làm
+        # bẩn dữ liệu gốc (xem docstring image_enhance.py). Nhờ vậy khi
+        # cửa sổ đổi kích thước (_on_video_label_resize gọi lại hàm này
+        # bằng chính _video_last_frame), ảnh vẽ lại luôn khớp đúng trạng
+        # thái config.IMAGE_ENHANCE_ENABLED tại thời điểm đó, kể cả khi
+        # người dùng vừa bật/tắt cờ này giữa lúc đang xem stream.
         self._video_last_frame = bgr_frame
+        display_frame = image_enhance.enhance_frame(bgr_frame)
+
         target_w, target_h = self._video_display_size
         if target_w <= 0 or target_h <= 0:
             return
 
-        frame_h, frame_w = bgr_frame.shape[:2]
+        frame_h, frame_w = display_frame.shape[:2]
         # Ảnh nguồn giờ lớn hơn (VGA) và thường bị THU NHỎ lại để vừa khung
         # hiển thị -> dùng INTER_AREA khi thu nhỏ cho ảnh nét/mượt hơn hẳn
         # so với INTER_LINEAR cũ (vốn hợp khi phóng to hơn là thu nhỏ).
         scale = target_w / frame_w if frame_w else 1.0
         interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-        resized = cv2.resize(bgr_frame, (target_w, target_h), interpolation=interpolation)
+        resized = cv2.resize(display_frame, (target_w, target_h), interpolation=interpolation)
         rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb_frame)
         tk_img = ImageTk.PhotoImage(img)
