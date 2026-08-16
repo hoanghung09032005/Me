@@ -26,12 +26,20 @@
  * bấm ngắt), việc ESP32 phát hiện TCP đã chết (car_bridge.cpp) có thể
  * không tức thời -> lệnh "S" tự động có thể chậm hoặc không bao giờ tới
  * -> xe tiếp tục chạy Mode 2 vô thời hạn dù không còn ai giám sát.
- * GUI (mode2_auto.py) phải gửi lệnh 'H' định kỳ (~300ms) trong lúc Auto
+ * GUI (mode2_auto.py) phải gửi lệnh 'H' định kỳ (~50-300ms) trong lúc Auto
  * đang chạy để "làm mới" đồng hồ này; nếu không nhận được gì trong
  * AUTO_LINK_TIMEOUT_TICKS, firmware TỰ dừng, không phụ thuộc ESP32 có
  * phát hiện mất TCP hay không - đây là lớp bảo vệ độc lập, chắc chắn hơn.
  * 150 tick = 1.5s, dư khoảng 5 lần bỏ lỡ heartbeat liên tiếp trước khi
- * trigger - đủ chịu được jitter/độ trễ thường gặp của WiFi. */
+ * trigger - đủ chịu được jitter/độ trễ thường gặp của WiFi.
+ *
+ * LƯU Ý QUAN TRỌNG (đã từng gây lỗi "Mode 2 chạy 1 lần rồi im lìm"):
+ * cơ chế này CHỈ hoạt động đúng nếu phía GUI (mode2_auto.py) thực sự gọi
+ * communication.link.heartbeat() định kỳ trong lúc auto_running == True.
+ * Nếu GUI quên gọi, sau đúng AUTO_LINK_TIMEOUT_TICKS firmware sẽ tự về
+ * MODE_IDLE trong ISR - KHÔNG gửi ACK/log gì về PC (xem lý do an toàn ISR
+ * ở nhánh else bên dưới) - nên GUI vẫn tưởng đang chạy trong khi xe đã
+ * lặng lẽ dừng hẳn. */
 #define AUTO_LINK_TIMEOUT_TICKS  150U
 
 volatile int car_mode = MODE_IDLE;
@@ -195,13 +203,29 @@ void TIM3_IRQHandler(void)
     TIM3->SR &= ~TIM_SR_UIF;
     control_ticks++;
 
+    /* ------------------------------------------------------------------
+     * ĐỌC 5 MẮT DÒ LINE GIỮA (PB8..PB12):
+     * FIX PHÂN CỰC - phần cứng thực tế xuất mức THẤP (0) khi mắt cảm biến
+     * ĐANG GẶP VẠCH ĐEN, và mức CAO (1) khi KHÔNG bắt được line. Toàn bộ
+     * logic PID trong mode2_obstacle.c (Run_Line_PID(), bảng
+     * switch(raw_state) với các giá trị 0x04/0x0C/0x08...) lại giả định
+     * NGƯỢC LẠI: bit=1 nghĩa là "đang gặp vạch". Nếu đọc thẳng mức điện áp
+     * như bản cũ (không đảo), toàn bộ thuật toán bám line sẽ hiểu sai
+     * hoàn toàn trạng thái cảm biến - xe tưởng mất line liên tục dù đang
+     * đi đúng vạch, hoặc ngược lại.
+     * Đảo cực NGAY TẠI ĐÂY (dùng "!") để mọi logic phía sau (PID, GUI...)
+     * chỉ cần biết đúng 1 quy ước duy nhất: bit=1 = đang gặp vạch. */
     raw_state = 0;
-    if (GPIOB->IDR & (1U << 12)) raw_state |= (1U << 0);
-    if (GPIOB->IDR & (1U << 11)) raw_state |= (1U << 1);
-    if (GPIOB->IDR & (1U << 10)) raw_state |= (1U << 2);
-    if (GPIOB->IDR & (1U << 9))  raw_state |= (1U << 3);
-    if (GPIOB->IDR & (1U << 8))  raw_state |= (1U << 4);
+    if (!(GPIOB->IDR & (1U << 12))) raw_state |= (1U << 0);
+    if (!(GPIOB->IDR & (1U << 11))) raw_state |= (1U << 1);
+    if (!(GPIOB->IDR & (1U << 10))) raw_state |= (1U << 2);
+    if (!(GPIOB->IDR & (1U << 9)))  raw_state |= (1U << 3);
+    if (!(GPIOB->IDR & (1U << 8)))  raw_state |= (1U << 4);
 
+    /* ------------------------------------------------------------------
+     * 2 MẮT BIÊN (PB13/PB14): phần cứng đã xuất mức CAO (1) khi gặp vạch,
+     * mức THẤP (0) khi chưa gặp - ĐÃ KHỚP SẴN với quy ước "bit=1 = gặp
+     * vạch" nên KHÔNG đảo cực ở đây, chỉ đọc thẳng mức điện áp như cũ. */
     uint8_t side_left = (GPIOB->IDR & (1U << 13)) ? 1U : 0U;
     uint8_t side_right = (GPIOB->IDR & (1U << 14)) ? 1U : 0U;
     side_left_state = side_left;
