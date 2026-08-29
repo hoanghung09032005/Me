@@ -1,35 +1,53 @@
 /**
  * @file mode3_follow.c
- * @brief Mode 3: Bam vat the - LOCK (full scan) + TRACK (cua so hep, re-center)
+ * @brief Mode 3: Bam vat the bang HC-SR04 quet servo - LOCK (tim tho toan
+ *        dai) + TRACK (bam min, cua so hep, tu re-center).
  *
- * Kien truc:
+ * LOCK  : quet toan dai 30->150 do, buoc LOCK_SCAN_STEP_DEG (15 do, 9
+ *         diem - giu day vi vat ~10cm o xa 40cm chi chiem ~14 do goc
+ *         nhin, hep hon khe ho neu quet thua hon). Tu dong quet lai tu
+ *         dau neu chua thay gi, khong bao gio "bo cuoc".
  *
- *  LOCK  : quet toan dai 30 -> 150 do, step 15 do (9 diem), moi diem do 3 lan
- *          + median. Dung de TIM vat lan dau hoac sau khi mat dau.
+ * TRACK : quet 1 cua so (TRACK_WINDOW_POINTS diem, buoc
+ *         TRACK_WINDOW_STEP_DEG) quanh track_center_angle, RE-CENTER
+ *         ngay tai goc vua tim duoc moi vong. Mat vat TRACK_LOST_LIMIT
+ *         vong lien tiep -> ve LOCK.
  *
- *  TRACK : chi quet mot cua so hep 5 diem (step van 15 do, khong doi do
- *          phan giai) quanh track_center_angle. Moi vong xong se RE-CENTER
- *          cua so ngay tai goc gan nhat vua tim duoc - day la diem khac biet
- *          voi ban ALIGN cu (ban cu giu window co dinh quanh goc CU nen bi
- *          "dinh" khi vat troi tu tu).
+ * MOI DIEM DO 2 LAN (TRACK_MEASURE_COUNT=2), khong con 1 lan: 1 lan do
+ * duy nhat rat de bi nhieu/timeout ngau nhien lam mat vat oan du vat
+ * van o do. Neu ca 2 lan hop le, lay gia tri GAN HON (an toan hon cho
+ * cac buoc dung/panic phia sau).
  *
- *          Neu TRACK khong thay vat hop le lien tiep TRACK_LOST_LIMIT vong
- *          thi tu dong quay ve LOCK de quet lai toan dai.
+ * DIEU KHIEN DONG CO (Update_Follow_Motor) - 4 uu tien theo thu tu, khong
+ * bao gio 2 hanh dong (xoay + tien/lui) cung 1 tick:
+ *   1. Khoang cach trong [STOP_NEAR, STOP_FAR] -> DUNG HAN, bat ke goc lech.
+ *   2. Con lech goc, CHUA dung luot nhich cua vong nay -> xoay tai cho 1 CU
+ *      NGAN (CORRECT_PIVOT -> CORRECT_WAIT), do dai TI LE VOI SO BUOC LECH,
+ *      co RAMP len/xuong o dau-cuoi de giam giat co khi (xem
+ *      TRACK_CORRECT_RAMP_TICKS).
+ *   3. Da dung het luot nhich ma VAN CON lech -> DUNG IM CHO (khong
+ *      tien/lui, tranh di CHEO sai huong) - cho vong quet moi mang ve error
+ *      tuoi roi moi nhich tiep.
+ *   4. Da THANG HUONG that su (eff_error == 0) -> TIEN/LUI THANG.
  *
- * MOTOR: da noi vao Update_Follow_Motor() - xe chi chay khi dang o
- *        MODE_TRACK va vua co best_distance hop le. 3 UU TIEN THEO THU TU
- *        (khong bao gio trong 2 hanh dong cung 1 tick):
- *          1. Neu khoang cach nam trong vung dung [STOP_NEAR,STOP_FAR] ->
- *             DUNG HAN, BAT KE vat dang lech trai/phai the nao (vat chi
- *             can nam tren cung tron ban kinh do quanh cam bien).
- *          2. Neu chua dung va con lech goc ro ret -> XOAY TAI CHO (2
- *             banh cung do lon PWM, nguoc chieu), KHONG tien/lui.
- *          3. Neu da thang huong va chua dung -> TIEN/LUI THANG (2 banh
- *             cung 1 gia tri PWM, khong xoay).
- *        Thiet ke nay dam bao 2 banh LUON nhan PWM cung do lon (chi khac
- *        dau khi xoay) - tranh truong hop cong don turn+forward ra 1 gia
- *        tri qua nho o 1 ben, duoi nguong dong co thuc su quay noi, gay
- *        "1 banh quay 1 banh khong" lam xe tu xoay ngoai y muon.
+ * KHOA DO TRONG LUC XOAY/PANIC: switch quet trong Update_Ultrasonic() chi
+ * chay khi correct_state == CORRECT_NONE VA khong panic_reverse_active -
+ * tranh doc sai do rung than xe/servo tro giua luc chassis dang chuyen
+ * dong manh. Phep do tiep tuc dung cho da bo khi mo khoa lai, khong quet
+ * lai tu dau.
+ *
+ * 3 VUNG KHOANG CACH (dong nhat, khong con chong lan):
+ *   dist < 5           : panic - MAT vat dot ngot ngay sau khi vua do rat
+ *                         gan (FOLLOW_PANIC_DIST_CM) -> lui full luc
+ *   5 <= dist < 10      : lui thuong (UU TIEN 4, khong panic)
+ *   10 <= dist <= 15     : DUNG (khoang cach an toan, doc lap voi logic xoay)
+ *   dist > 15           : tien toi
+ *
+ * DANH DOI: moi vong quet chi sinh DUNG 1 lan nhich (khong xoay lien tuc
+ * dua tren error cu) -> loi goc lon can vai vong quet de hoi tu, cham hon
+ * ly thuyet nhung doi lai khong bao gio xoay qua da/dao dong khong dung.
+ * Cua so TRACK rong (5 diem) + do 2 lan/diem lam vong quet cham hon truoc,
+ * nhung uu tien dung huong/nhan vat truoc, toc do la thu yeu.
  */
 
 #include "mode3_follow.h"
@@ -47,46 +65,40 @@
 
 
 /* ================================================================
- * LOCK - quet toan dai
- *
- * 30,45,60,75,90,105,120,135,150 => 9 diem
+ * LOCK - quet tho toan dai, chi de tim so bo huong vat (TRACK bam chinh
+ * xac lai sau)
  * ================================================================ */
 
-#define SCAN_STEP_DEG             15
-
+#define LOCK_SCAN_STEP_DEG        15
 #define SCAN_POINT_COUNT \
-    (((SERVO_TRACK_MAX_DEG - SERVO_TRACK_MIN_DEG) / SCAN_STEP_DEG) + 1)
+    (((SERVO_TRACK_MAX_DEG - SERVO_TRACK_MIN_DEG) / LOCK_SCAN_STEP_DEG) + 1)
 
-#define SERVO_SETTLE_TICKS         25   /* LOCK: servo nhay xa, can settle lau */
-#define MEASURE_COUNT              3    /* LOCK: 3 lan do + median */
+#define SERVO_SETTLE_TICKS         25   /* servo nhay xa, can settle lau */
+#define MEASURE_COUNT              3    /* 3 lan do + median */
 
 
 /* ================================================================
- * TRACK - cua so hep quanh track_center_angle
+ * TRACK - cua so quanh track_center_angle, quet min de bam chinh xac
  *
- * QUAN TRONG: giu nguyen do phan giai 15 do (khong tang step len 30 do),
- * chi tang SO DIEM (5 diem) de mo rong be rong cua so. Neu tang step,
- * khe ho giua 2 diem do se lon hon goc mo chum tia HC-SR04 tai khoang
- * cach xa, de bo sot vat hep (chai nuoc, coc).
+ * [SUA] TRACK_WINDOW_POINTS 3 -> 5 (cua so 30 do -> 50 do): cua so hep
+ * de vat "troi" ra ngoai giua 2 vong quet neu vat dich chuyen, gay cam
+ * giac "phat hien kem". Doi lai vong quet TRACK cham hon truoc - chap
+ * nhan duoc vi uu tien nhan vat truoc toc do.
+ * [SUA] TRACK_MEASURE_COUNT 1 -> 2: xem giai thich o dau file.
  * ================================================================ */
 
-#define TRACK_WINDOW_POINTS        5    /* step 15 do => cua so rong 60 do */
+#define TRACK_WINDOW_POINTS        5    /* cua so rong 50 do (5 x 15) */
 #define TRACK_WINDOW_STEP_DEG      15
 #define TRACK_LOST_LIMIT           2    /* so vong lien tiep khong thay vat truoc khi ve LOCK */
-#define TRACK_SETTLE_TICKS         10   /* TRACK: servo nhich it, settle nhanh hon */
-#define TRACK_MEASURE_COUNT        1    /* TRACK: 1 lan do/diem, khong median */
+#define TRACK_SETTLE_TICKS         6
+#define TRACK_MEASURE_COUNT        2
 
 
 /* ================================================================
  * HC-SR04
  * ================================================================ */
 
-/* [SUA] Tang tam phat hien tu 30 -> 40cm: xe chay nhanh co the "vut qua"
- * vat truoc khi vong quet servo (~750ms/vong) kip nhan ra, dan den mat
- * dau vat mac du vat van con trong tam mat. Tang tam giup TRACK giu duoc
- * vat lau hon o toc do cao. */
-#define FOLLOW_MAX_DIST_CM        40
-
+#define FOLLOW_MAX_DIST_CM        40    /* tam mat vat - qua khoang cach nay coi nhu khong thay */
 #define PING_WAIT_TICKS            5    /* dung chung cho ca LOCK va TRACK */
 
 
@@ -94,76 +106,40 @@
  * MOTOR
  * ================================================================ */
 
-#define FOLLOW_BASE_SPEED          300
 #define FOLLOW_TURN_SPEED          400
 #define FOLLOW_MAX_PWM             700
 
-/* [SUA] Doi tu cong thuc ty le (dist_err * KP) sang 3 VUNG KHOANG CACH
- * CO DINH. Ly do: voi FOLLOW_MAX_DIST_CM gioi han dist_err toi da, PWM
- * "forward" truoc day gan nhu luon bi clamp ve dung 1 gia tri san
- * (FOLLOW_MIN_MOVE_PWM) trong toan bo dai khoang cach thuc te co the
- * xay ra - nghia la "ty le" chi la hinh thuc, khong tao ra khac biet
- * thuc chat.
- *
- * 3 vung, moi vung 1 toc do PWM co dinh:
- *   dist <  FOLLOW_STOP_NEAR_CM              -> LUI  (FOLLOW_RETREAT_SPEED)
- *   FOLLOW_STOP_NEAR_CM..FOLLOW_STOP_FAR_CM  -> DUNG (pwm = 0), BAT KE goc
- *   dist >  FOLLOW_STOP_FAR_CM                -> TIEN (FOLLOW_APPROACH_SPEED)
- *
- * Khong co truong hop dist am/loi lot vao day: HCSR04_GetDistance tra ve
- * gia tri khong hop le (<=0) da bi loc bo o ROUND_MEASURE_WAIT (xem
- * "dist > 0 && dist <= FOLLOW_MAX_DIST_CM"), nen best_distance khi vao
- * toi day luon la mot php do THAT trong khoang hop le. Truong hop mat
- * hoan toan tin hieu (khong do duoc) da duoc panic_reverse_active xu ly
- * RIENG o dau ham nay, khong lien quan gi den 3 vung o duoi. */
-#define FOLLOW_STOP_NEAR_CM        7
-#define FOLLOW_STOP_FAR_CM         12
-
+/* 3 vung khoang cach co dinh - xem bang o dau file. Dong nhat lai:
+ * STOP_NEAR/FAR doi 7/12 -> 10/15, PANIC giu tuyet doi = 5 (khong con
+ * cong thuc tuong doi theo STOP_NEAR nhu ban cu, tranh nham lan khi sau
+ * nay doi STOP_NEAR ma quen doi PANIC theo). */
+#define FOLLOW_STOP_NEAR_CM        10
+#define FOLLOW_STOP_FAR_CM         15
 #define FOLLOW_APPROACH_SPEED      300
-/* Lui hoi manh hon tien: nguoi dieu khien vat co the day vat toi gan xe
- * nhanh hon toc do xe tu tien toi, nen can phan ung nhanh hon khi lui de
- * tranh bi dam/ep sat. Neu thuc te lui qua giat, ha xuong gan bang
- * FOLLOW_APPROACH_SPEED. */
-#define FOLLOW_RETREAT_SPEED       320
+#define FOLLOW_RETREAT_SPEED       320   /* lui manh hon tien: vat co the bi day toi nhanh hon xe tu tien */
 
-/* ================================================================
- * PANIC REVERSE
- * ================================================================ */
-#define FOLLOW_PANIC_DIST_CM       8
+#define FOLLOW_PANIC_DIST_CM       5     /* mat vat dot ngot ngay sau khi vua do duoi muc nay moi coi la panic that su */
 #define FOLLOW_PANIC_REVERSE_PWM   300
 #define FOLLOW_PANIC_TICKS_LIMIT   30
 
-/*
- * FOLLOW_ANGLE_DEADZONE_DEG: vung chet cho error (do lech goc servo).
- * Goc servo chi co do phan giai SCAN_STEP_DEG/TRACK_WINDOW_STEP_DEG
- * (15 do) - moi vong TRACK re-scan, cua so do "hunting" qua lai quanh
- * huong that cua vat (vd 75/90/105) DU VAT DUNG YEN, chi vi sai so
- * luong tu hoa cua servo/HC-SR04. Neu khong loc, moi lan hunting nhu
- * vay se kich hoat xoay (xem UU TIEN 2 trong Update_Follow_Motor) du
- * vat dung yen. Coi |error| <= 1 buoc quet la "dang thang", khong xoay -
- * chi xoay that su khi vat lech ro rang (>= 2 buoc quet).
- *
- * SUA LOI (phat hien khi review lai - dieu kien bien cu la NO-OP): ban
- * truoc dung so sanh CHAT (>  / <), vi error CHI CO THE la boi so cua
- * SCAN_STEP_DEG (15) - AngleAtIndex() luon cong/tru boi so 15 vao mot
- * moc cung la boi so 15 (track_center_angle khoi tao = 90). Voi
- * FOLLOW_ANGLE_DEADZONE_DEG=15, dieu kien "> -15 && < 15" CHI dung voi
- * error=0 (von di da bang 0) - moi gia tri thuc te khac (+-15, +-30,...)
- * deu KHONG lot qua dieu kien nay, nen eff_error khong bao gio thuc su bi
- * ep ve 0 ngoai truong hop no da la 0 san. Doi sang so sanh BAO GOM BIEN
- * (>= / <=) de +-15 (dung 1 buoc quet) cung duoc coi la "dang thang" -
- * dung y do that su cua deadzone nay. */
-#define FOLLOW_ANGLE_DEADZONE_DEG  SCAN_STEP_DEG
+/* Vung chet cho error: goc servo chi co do phan giai TRACK_WINDOW_STEP_DEG,
+ * moi vong TRACK re-scan de "hunting" +-1 buoc du vat dung yen (sai so
+ * luong tu hoa). So sanh BAO GOM BIEN (>=/<=) de +-1 buoc cung duoc coi
+ * la "dang thang". */
+#define FOLLOW_ANGLE_DEADZONE_DEG  TRACK_WINDOW_STEP_DEG
 
-
-/* ================================================================
- * AI MODE
- * ================================================================ */
-
-#define AI_FOLLOW_DEADZONE_X       10
-#define AI_FOLLOW_DEADZONE_Y       10
-#define AI_FOLLOW_KP_X             8
-#define AI_FOLLOW_KP_Y             4
+/* Xoay tai cho DUNG 1 cu/vong quet, do dai TI LE SO BUOC LECH
+ * (abs(eff_error)/TRACK_WINDOW_STEP_DEG, toi da TRACK_CORRECT_MAX_STEPS
+ * buoc) - loi lon nhich lau hon, hoi tu nhanh hon ma khong can nhieu
+ * vong quet lien tiep.
+ * [THEM] TRACK_CORRECT_RAMP_TICKS: lam mem PWM tang/giam dan trong
+ * RAMP_TICKS dau va RAMP_TICKS cuoi cua cu nhich (thay vi bat/tat dot
+ * ngot o FOLLOW_TURN_SPEED) - giam giat co khi that su cam nhan duoc,
+ * cung giam rung than xe lam sieu am doc nhieu hon luc vua nhich xong. */
+#define TRACK_CORRECT_PIVOT_TICKS  6    /* burst co so: ~60ms / 1 buoc lech */
+#define TRACK_CORRECT_WAIT_TICKS   3    /* dung han dap quan tinh, TRUOC KHI cho quet lai */
+#define TRACK_CORRECT_MAX_STEPS    4    /* eff_error toi da 60 do = 4 buoc - gioi han tren */
+#define TRACK_CORRECT_RAMP_TICKS   2    /* so tick lam mem o dau va o cuoi cu nhich */
 
 
 /* ================================================================
@@ -188,15 +164,18 @@ typedef enum
 
 } FollowState;
 
+typedef enum
+{
+    CORRECT_NONE = 0,
+    CORRECT_PIVOT,
+    CORRECT_WAIT
+
+} CorrectState_t;
+
 
 /* ================================================================
  * BIEN
  * ================================================================ */
-
-static volatile uint8_t follow_use_ai = 0;
-
-static volatile int ai_x_err = 0;
-static volatile int ai_y_err = 0;
 
 static volatile FollowState follow_state = ROUND_SET_ANGLE;
 static volatile FollowMode  follow_mode  = MODE_LOCK;
@@ -221,6 +200,17 @@ static volatile int panic_reverse_ticks = 0;
 
 static volatile int prev_out_l = 0;
 static volatile int prev_out_r = 0;
+
+static volatile CorrectState_t correct_state = CORRECT_NONE;
+static volatile int correct_timer = 0;
+static volatile int correct_dir = 0;
+static volatile int pivot_ticks_target = TRACK_CORRECT_PIVOT_TICKS;
+
+/* Da dung luot nhich (1 cu PIVOT->WAIT) cua VONG QUET HIEN TAI hay chua.
+ * Reset ve 0 DUY NHAT trong FinishRound() (moi khi co error tuoi tu 1 vong
+ * quet MOI). Khi =1, khong nhich them trong cung vong - neu van con lech,
+ * roi vao UU TIEN 3 (dung im cho). */
+static volatile uint8_t round_pivot_used = 0;
 
 
 extern volatile int error;
@@ -266,7 +256,7 @@ static int AngleAtIndex(int idx)
 
     if (follow_mode == MODE_LOCK)
     {
-        angle = SERVO_TRACK_MIN_DEG + idx * SCAN_STEP_DEG;
+        angle = SERVO_TRACK_MIN_DEG + idx * LOCK_SCAN_STEP_DEG;
     }
     else
     {
@@ -285,11 +275,6 @@ static int AngleAtIndex(int idx)
 void Mode3_Follow_Init(void)
 {
     int i;
-
-    follow_use_ai = 0;
-
-    ai_x_err = 0;
-    ai_y_err = 0;
 
     follow_state = ROUND_SET_ANGLE;
     follow_mode = MODE_LOCK;
@@ -312,6 +297,12 @@ void Mode3_Follow_Init(void)
     prev_out_l = 0;
     prev_out_r = 0;
 
+    correct_state = CORRECT_NONE;
+    correct_timer = 0;
+    correct_dir = 0;
+    pivot_ticks_target = TRACK_CORRECT_PIVOT_TICKS;
+    round_pivot_used = 0;
+
     error = 0;
 
     for (i = 0; i < SCAN_POINT_COUNT; i++)
@@ -329,17 +320,14 @@ void Mode3_Follow_Init(void)
 }
 
 
+/* Stub rong - giu lai CHI de khong pha vo API cong khai da khai bao trong
+ * mode3_follow.h (Mode 3 hien chi con duong bam vat bang sieu am, khong
+ * con nhanh AI Camera). Neu header/GUI khong con goi toi, co the xoa han
+ * ca khai bao lan dinh nghia nay. */
 void Mode3_Follow_SetError(int x_err, int y_err)
 {
-    follow_use_ai = 1;
-
-    if (x_err < -100) x_err = -100;
-    if (x_err > 100)  x_err = 100;
-    if (y_err < -100) y_err = -100;
-    if (y_err > 100)  y_err = 100;
-
-    ai_x_err = x_err;
-    ai_y_err = y_err;
+    (void)x_err;
+    (void)y_err;
 }
 
 
@@ -356,7 +344,7 @@ static void FinishRound(void)
             if (scan_dist[i] > 0 && scan_dist[i] < found_distance)
             {
                 found_distance = scan_dist[i];
-                found_angle = SERVO_TRACK_MIN_DEG + i * SCAN_STEP_DEG;
+                found_angle = SERVO_TRACK_MIN_DEG + i * LOCK_SCAN_STEP_DEG;
             }
         }
 
@@ -374,6 +362,8 @@ static void FinishRound(void)
         {
             best_angle = SERVO_TRACK_CENTER_DEG;
             best_distance = 999;
+            /* Khong doi follow_mode: van con MODE_LOCK, vong sau tu dong
+             * quet lai tu dau - khong "bo cuoc" du chua thay vat. */
         }
     }
     else
@@ -430,6 +420,10 @@ static void FinishRound(void)
     debug_follow_mode = (int)follow_mode;
 
     error = SERVO_TRACK_CENTER_DEG - best_angle;
+
+    /* Error vua duoc lam moi that su -> cho phep sinh DUNG 1 lan nhich moi
+     * (neu can) cho vong nay. */
+    round_pivot_used = 0;
 }
 
 
@@ -439,8 +433,8 @@ static void Update_Follow_Motor(int *pwm_l, int *pwm_r)
     int forward;
     int eff_error;
 
-    /* [SUA] Panic reverse: PWM co dinh, khong RateLimit - ly do giong
-     * 2 nhanh TURN/DRIVE ben duoi (xem giai thich chi tiet o do). */
+    /* Panic reverse: PWM co dinh, gianh quyen dieu khien hoan toan, huy
+     * moi cu nhich dang do dang. */
     if (panic_reverse_active)
     {
         *pwm_l = -FOLLOW_PANIC_REVERSE_PWM;
@@ -448,6 +442,10 @@ static void Update_Follow_Motor(int *pwm_l, int *pwm_r)
 
         prev_out_l = *pwm_l;
         prev_out_r = *pwm_r;
+
+        correct_state = CORRECT_NONE;
+        correct_timer = 0;
+        round_pivot_used = 0;
 
         if (++panic_reverse_ticks >= FOLLOW_PANIC_TICKS_LIMIT)
         {
@@ -468,70 +466,117 @@ static void Update_Follow_Motor(int *pwm_l, int *pwm_r)
         *pwm_r = 0;
         prev_out_l = 0;
         prev_out_r = 0;
+
+        correct_state = CORRECT_NONE;
+        correct_timer = 0;
+        round_pivot_used = 0;
         return;
     }
 
-    /* [SUA] UU TIEN 1 - VUNG DUNG BAT KE GOC LECH:
-     * Vat duoc coi la "da bam duoc" mien khoang cach nam trong
-     * [FOLLOW_STOP_NEAR_CM, FOLLOW_STOP_FAR_CM], BAT KE vat dang lech
-     * trai/phai bao nhieu - noi cach khac, vat chi can nam tren CUNG
-     * TRON co ban kinh trong khoang do, tam la cam bien sieu am, la du
-     * de dung han, khong xoay them de "can chinh" nua. Kiem tra dieu
-     * kien nay TRUOC va return NGAY, khong de eff_error/turn ben duoi
-     * co co hoi chen vao. */
+    /* UU TIEN 1 - vung dung an toan, bat ke goc lech. */
     if (best_distance >= FOLLOW_STOP_NEAR_CM && best_distance <= FOLLOW_STOP_FAR_CM)
     {
         *pwm_l = 0;
         *pwm_r = 0;
         prev_out_l = 0;
         prev_out_r = 0;
+
+        correct_state = CORRECT_NONE;
+        correct_timer = 0;
+        round_pivot_used = 0;
         return;
     }
 
     eff_error = error;
 
-    /* SUA LOI (xem giai thich day du o dinh file, dinh nghia
-     * FOLLOW_ANGLE_DEADZONE_DEG): doi sang so sanh BAO GOM BIEN (>= / <=)
-     * thay vi so sanh CHAT (> / <) - voi so sanh chat cu, dieu kien nay
-     * la NO-OP vi error luon la boi so cua 15, khong bao gio roi vao
-     * khoang mo (-15, 15) tru dung 0. */
     if (eff_error >= -FOLLOW_ANGLE_DEADZONE_DEG && eff_error <= FOLLOW_ANGLE_DEADZONE_DEG)
     {
         eff_error = 0;
     }
 
-    /* [SUA] UU TIEN 2 - XOAY TAI CHO (khong tien/lui dong thoi):
-     * Truoc day out_l = forward + turn / out_r = forward - turn cong 2
-     * thanh phan lai voi nhau - khi forward va turn trai dau (vd forward
-     * am luc lui, turn duong), 1 ben bi TRIET TIEU BOT con ben kia bi
-     * CONG DON, tao ra 1 gia tri PWM nho/lech han so voi ben kia. Neu
-     * gia tri nho do roi xuong duoi nguong dong co that su quay noi
-     * (so sanh MANUAL_MIN_PWM=300 dang dung ben mode1.c cho lai tay) -
-     * banh do se i, banh kia van chay binh thuong => xe tu xoay vong
-     * ngoai y muon, dung la trieu chung ban gap phai.
-     *
-     * Sua: KHONG BAO GIO cong turn va forward trong cung 1 tick nua. Neu
-     * con lech goc ro ret (eff_error != 0), CHI xoay tai cho (2 banh
-     * dung do lon FOLLOW_TURN_SPEED, nguoc chieu nhau) - khong tien/lui.
-     * Chi khi da thang huong (eff_error == 0) moi roi xuong UU TIEN 3
-     * de tien/lui THANG (2 banh cung 1 gia tri, khong lech). Ca 2 nhanh
-     * deu dam bao 2 banh LUON cung do lon PWM (chi khac dau khi xoay),
-     * khong con truong hop 1 banh PWM nho hon ban kia. */
-    if (eff_error != 0)
+    /* UU TIEN 2 - xoay tai cho DUNG 1 cu/vong quet, do dai ti le so buoc
+     * lech (xem giai thich o dinh nghia TRACK_CORRECT_*). */
+    if (correct_state == CORRECT_NONE && eff_error != 0 && !round_pivot_used)
     {
-        turn = (eff_error > 0) ? FOLLOW_TURN_SPEED : -FOLLOW_TURN_SPEED;
+        int steps = (eff_error > 0) ? (eff_error / TRACK_WINDOW_STEP_DEG)
+                                     : (-eff_error / TRACK_WINDOW_STEP_DEG);
+
+        if (steps < 1) steps = 1;
+        if (steps > TRACK_CORRECT_MAX_STEPS) steps = TRACK_CORRECT_MAX_STEPS;
+
+        correct_state = CORRECT_PIVOT;
+        correct_timer = 0;
+        correct_dir = (eff_error > 0) ? 1 : -1;
+        pivot_ticks_target = TRACK_CORRECT_PIVOT_TICKS * steps;
+    }
+
+    if (correct_state == CORRECT_PIVOT)
+    {
+        /* [THEM] Ramp: trong RAMP_TICKS dau va RAMP_TICKS cuoi cua cu
+         * nhich, tang/giam PWM tuyen tinh thay vi bat/tat dot ngot o
+         * FOLLOW_TURN_SPEED - giam giat co khi va rung than xe. Doan
+         * giua (neu pivot du dai) van chay full toc nhu cu. */
+        int ramp_in = correct_timer + 1;
+        int ramp_out = pivot_ticks_target - correct_timer;
+        int scale = TRACK_CORRECT_RAMP_TICKS;
+
+        if (ramp_in < scale)  scale = ramp_in;
+        if (ramp_out < scale) scale = ramp_out;
+        if (scale < 1) scale = 1;
+        if (scale > TRACK_CORRECT_RAMP_TICKS) scale = TRACK_CORRECT_RAMP_TICKS;
+
+        turn = (correct_dir * FOLLOW_TURN_SPEED * scale) / TRACK_CORRECT_RAMP_TICKS;
 
         *pwm_l = turn;
         *pwm_r = -turn;
 
         prev_out_l = *pwm_l;
         prev_out_r = *pwm_r;
+
+        if (++correct_timer >= pivot_ticks_target)
+        {
+            correct_state = CORRECT_WAIT;
+            correct_timer = 0;
+        }
+
         return;
     }
 
-    /* [SUA] UU TIEN 3 - TIEN/LUI THANG (da het lech goc, khong con trong
-     * vung dung): 2 banh nhan CUNG 1 gia tri PWM co dinh, khong co thanh
-     * phan xoay nao cong vao. */
+    if (correct_state == CORRECT_WAIT)
+    {
+        *pwm_l = 0;
+        *pwm_r = 0;
+
+        prev_out_l = 0;
+        prev_out_r = 0;
+
+        if (++correct_timer >= TRACK_CORRECT_WAIT_TICKS)
+        {
+            /* Xong 1 nhich duy nhat cua vong nay. Tro ve CORRECT_NONE de
+             * Update_Ultrasonic() mo khoa lai qua trinh do. */
+            correct_state = CORRECT_NONE;
+            correct_timer = 0;
+            round_pivot_used = 1;
+        }
+
+        return;
+    }
+
+    /* UU TIEN 3 - da dung het luot nhich ma VAN CON lech -> dung im cho,
+     * TUYET DOI khong tien/lui (tranh di cheo sai huong). Do da mo khoa
+     * lai (correct_state == CORRECT_NONE), se som mang ve error moi. */
+    if (eff_error != 0)
+    {
+        *pwm_l = 0;
+        *pwm_r = 0;
+
+        prev_out_l = 0;
+        prev_out_r = 0;
+
+        return;
+    }
+
+    /* UU TIEN 4 - da thang huong that su -> tien/lui thang. */
     forward = (best_distance > FOLLOW_STOP_FAR_CM) ? FOLLOW_APPROACH_SPEED : -FOLLOW_RETREAT_SPEED;
 
     *pwm_l = forward;
@@ -544,6 +589,19 @@ static void Update_Follow_Motor(int *pwm_l, int *pwm_r)
 
 static void Update_Ultrasonic(int *pwm_l, int *pwm_r)
 {
+    /* Goi dong co TRUOC, roi moi xet co cho do tiep tuc khong - khoa do
+     * NGAY LAP TUC trong chinh tick chuyen sang CORRECT_PIVOT/panic,
+     * khong lot 1 tick nao. Do CHI chay khi than xe dang dung yen/di
+     * thang that su (khong dang xoay, khong dang panic-reverse) - trong
+     * ca 2 truong hop kia than xe rung/di chuyen manh, do luc nay de sai,
+     * de mat dau vat hon. */
+    Update_Follow_Motor(pwm_l, pwm_r);
+
+    if (correct_state != CORRECT_NONE || panic_reverse_active)
+    {
+        return;
+    }
+
     switch (follow_state)
     {
         case ROUND_SET_ANGLE:
@@ -628,8 +686,37 @@ static void Update_Ultrasonic(int *pwm_l, int *pwm_r)
                 {
                     result = measure_values[0];
                 }
+                else if (need == 2)
+                {
+                    /* [THEM] TRACK: 2 lan do, khong median (can >=3 mau).
+                     * Neu ca 2 hop le, lay gia tri GAN HON - an toan hon
+                     * cho cac buoc dung/panic phia sau va giam rui ro bo
+                     * sot vat neu 1 trong 2 lan bi nhieu cao hon thuc te.
+                     * Neu chi 1 lan hop le, dung lan do; ca 2 that bai moi
+                     * coi la mat vat that su o diem nay. */
+                    int a = measure_values[0];
+                    int b = measure_values[1];
+
+                    if (a > 0 && b > 0)
+                    {
+                        result = (a < b) ? a : b;
+                    }
+                    else if (a > 0)
+                    {
+                        result = a;
+                    }
+                    else if (b > 0)
+                    {
+                        result = b;
+                    }
+                    else
+                    {
+                        result = -1;
+                    }
+                }
                 else
                 {
+                    /* LOCK: 3 lan do + median, bu neu 1 lan bi loi. */
                     int valid_count = 0;
 
                     int a = measure_values[0];
@@ -690,49 +777,6 @@ static void Update_Ultrasonic(int *pwm_l, int *pwm_r)
             break;
         }
     }
-
-    Update_Follow_Motor(pwm_l, pwm_r);
-}
-
-
-static void Update_AI(int *pwm_l, int *pwm_r)
-{
-    int abs_x = (ai_x_err < 0) ? -ai_x_err : ai_x_err;
-    int abs_y = (ai_y_err < 0) ? -ai_y_err : ai_y_err;
-
-    error = ai_x_err;
-
-    if (abs_x > AI_FOLLOW_DEADZONE_X)
-    {
-        int turn = (ai_x_err * FOLLOW_TURN_SPEED) / 100;
-
-        if (turn > FOLLOW_TURN_SPEED) turn = FOLLOW_TURN_SPEED;
-        if (turn < -FOLLOW_TURN_SPEED) turn = -FOLLOW_TURN_SPEED;
-
-        *pwm_l = turn;
-        *pwm_r = -turn;
-    }
-    else
-    {
-        if (abs_y > AI_FOLLOW_DEADZONE_Y)
-        {
-            int speed = FOLLOW_BASE_SPEED - (ai_y_err * AI_FOLLOW_KP_Y);
-
-            if (speed > FOLLOW_MAX_PWM) speed = FOLLOW_MAX_PWM;
-            if (speed < -FOLLOW_MAX_PWM) speed = -FOLLOW_MAX_PWM;
-
-            if (speed > 0 && speed < 200) speed = 200;
-            if (speed < 0 && speed > -200) speed = -200;
-
-            *pwm_l = speed;
-            *pwm_r = speed;
-        }
-        else
-        {
-            *pwm_l = 0;
-            *pwm_r = 0;
-        }
-    }
 }
 
 
@@ -741,14 +785,7 @@ void Mode3_Follow_Update(void)
     int pwm_l = 0;
     int pwm_r = 0;
 
-    if (follow_use_ai)
-    {
-        Update_AI(&pwm_l, &pwm_r);
-    }
-    else
-    {
-        Update_Ultrasonic(&pwm_l, &pwm_r);
-    }
+    Update_Ultrasonic(&pwm_l, &pwm_r);
 
     if (pwm_l > FOLLOW_MAX_PWM) pwm_l = FOLLOW_MAX_PWM;
     if (pwm_l < -FOLLOW_MAX_PWM) pwm_l = -FOLLOW_MAX_PWM;
