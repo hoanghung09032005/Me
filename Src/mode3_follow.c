@@ -110,15 +110,15 @@
 #define FOLLOW_MAX_PWM             700
 
 /* 3 vung khoang cach co dinh - xem bang o dau file. Dong nhat lai:
- * STOP_NEAR/FAR doi 7/12 -> 10/15, PANIC giu tuyet doi = 5 (khong con
- * cong thuc tuong doi theo STOP_NEAR nhu ban cu, tranh nham lan khi sau
+ * PANIC giu tuyet doi = 5 (khong con cong thuc tuong doi theo
+ * STOP_NEAR nhu ban cu, tranh nham lan khi sau
  * nay doi STOP_NEAR ma quen doi PANIC theo). */
-#define FOLLOW_STOP_NEAR_CM        10
-#define FOLLOW_STOP_FAR_CM         15
+#define FOLLOW_STOP_NEAR_CM        5
+#define FOLLOW_STOP_FAR_CM         13
 #define FOLLOW_APPROACH_SPEED      300
 #define FOLLOW_RETREAT_SPEED       320   /* lui manh hon tien: vat co the bi day toi nhanh hon xe tu tien */
 
-#define FOLLOW_PANIC_DIST_CM       5     /* mat vat dot ngot ngay sau khi vua do duoi muc nay moi coi la panic that su */
+#define FOLLOW_PANIC_DIST_CM       3     /* mat vat dot ngot ngay sau khi vua do duoi muc nay moi coi la panic that su */
 #define FOLLOW_PANIC_REVERSE_PWM   300
 #define FOLLOW_PANIC_TICKS_LIMIT   30
 
